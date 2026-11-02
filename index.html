@@ -681,6 +681,8 @@ body { font-family: 'Plus Jakarta Sans', sans-serif; }
 // A fresh URL avoids a stale chatbot.js after a GitHub Pages deployment.
 (function () {
   let started = false;
+  let expectedHostOrigin = '';
+  try { expectedHostOrigin = new URL(document.referrer).origin; } catch (_) {}
   function start(context) {
     if (started) return;
     started = true;
@@ -690,11 +692,12 @@ body { font-family: 'Plus Jakarta Sans', sans-serif; }
     document.body.appendChild(botScript);
   }
   window.addEventListener('message', function (event) {
-    if (event.source === window.parent && event.data?.type === 'archie-host-context') start(event.data);
+    if (event.source === window.parent && event.data?.type === 'archie-host-context' &&
+        (!expectedHostOrigin || event.origin === expectedHostOrigin)) start(event.data);
   });
   if (window.parent === window) start();
   else {
-    window.parent.postMessage({ type: 'archie-widget-ready' }, '*');
+    window.parent.postMessage({ type: 'archie-widget-ready' }, expectedHostOrigin || '*');
     setTimeout(() => start(), 1500);
   }
 })();

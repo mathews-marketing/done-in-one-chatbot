@@ -8,7 +8,118 @@
   if (!ownScript || !ownScript.src) return;
   const pageBase = new URL('./', ownScript.src);
   const frameOrigin = pageBase.origin;
+  // Mobile launcher distance from the bottom, including the widget's 16px inset.
+  // Optional website setting: <script ... data-mobile-bottom="80" defer></script>.
+  const configuredMobileBottom = Number(ownScript.getAttribute('data-mobile-bottom') ?? 80);
+  const mobileBottom = Number.isFinite(configuredMobileBottom) && configuredMobileBottom >= 16
+    ? configuredMobileBottom : 80;
   const keys = ['doiChatVisitorId', 'chatSessionId', 'implantBotName'];
+// Runs on the host page. It reads existing tags/cookies; it installs no tracking tags.
+function createAttributionCollector() {
+    const parameterNames = [
+        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+        'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'ttclid'
+    ];
+    const sessionKey = 'doiChatAttributionV1';
+    const sessionTtl = 30 * 60 * 1000;
+    let memoryAttribution = null;
+    let recentGa4 = {};
+
+    function readSession() {
+        let value = memoryAttribution;
+        try {
+            value = JSON.parse(window.sessionStorage.getItem(sessionKey) || 'null') || value;
+        } catch (_) { /* Use the in-page fallback when storage is blocked. */ }
+        return value && Date.now() - Number(value.lastSeenAt) < sessionTtl ? value : null;
+    }
+
+    function readCookie(name) {
+        try {
+            const entry = document.cookie.split(';').map(value => value.trim())
+                .find(value => value.startsWith(name + '='));
+            if (!entry) return null;
+            const value = entry.slice(name.length + 1);
+            try { return decodeURIComponent(value); } catch (_) { return value; }
+        } catch (_) { return null; }
+    }
+
+    function measurementId() {
+        if (typeof window.__archieGA4MeasurementId === 'string') return window.__archieGA4MeasurementId;
+        const ids = {
+            'getdoneinone.com': 'G-Y8D0SC75XT',
+            'www.getdoneinone.com': 'G-Y8D0SC75XT',
+            'go.getdoneinone.com': 'G-VC7X2696N3'
+        };
+        return ids[window.location.hostname] || null;
+    }
+
+    function snapshot() {
+        const params = new URL(window.location.href).searchParams;
+        const incoming = Object.fromEntries(parameterNames.map(key => [key, params.get(key) || null]));
+        const fingerprint = JSON.stringify(incoming);
+        let cached = readSession();
+        if (Object.values(incoming).some(value => value !== null) && cached?.fingerprint !== fingerprint) {
+            cached = {
+                parameters: incoming, fingerprint,
+                landingPageUrl: window.location.href,
+                referrerUrl: document.referrer || null,
+                capturedAt: new Date().toISOString()
+            };
+        }
+        if (cached) {
+            cached.lastSeenAt = Date.now();
+            memoryAttribution = cached;
+            try { window.sessionStorage.setItem(sessionKey, JSON.stringify(cached)); } catch (_) {}
+        }
+        return {
+            ...Object.fromEntries(parameterNames.map(key => [key, cached?.parameters?.[key] || null])),
+            pageUrl: window.location.href,
+            pageTitle: document.title || '',
+            referrer: document.referrer || null,
+            attribution_page_url: cached?.landingPageUrl || window.location.href,
+            attribution_referrer_url: cached?.referrerUrl || document.referrer || null,
+            attribution_captured_at: cached?.capturedAt || null,
+            hubspotutk: readCookie('hubspotutk'),
+            ga4_measurement_id: measurementId(),
+            ga4_client_id: recentGa4.ga4_client_id || null,
+            ga4_session_id: recentGa4.ga4_session_id || null,
+            ga4_session_number: recentGa4.ga4_session_number || null
+        };
+    }
+
+    function getGa4Value(field) {
+        return new Promise(resolve => {
+            const id = measurementId();
+            const tag = typeof window.gtag === 'function' ? window.gtag :
+                (Array.isArray(window.dataLayer) ? function () { window.dataLayer.push(arguments); } : null);
+            if (!id || !tag) { resolve(null); return; }
+            let done = false;
+            const finish = value => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve(value === undefined || value === null || value === '' ? null : String(value));
+            };
+            const timer = setTimeout(() => finish(null), 1600);
+            try { tag('get', id, field, finish); } catch (_) { finish(null); }
+        });
+    }
+
+    async function collect() {
+        // Capture the landing URL before waiting for an analytics callback.
+        snapshot();
+        const fields = ['client_id', 'session_id', 'session_number'];
+        const values = await Promise.all(fields.map(getGa4Value));
+        // Do not fabricate IDs or retain stale IDs if analytics is unavailable.
+        recentGa4 = Object.fromEntries(fields.map((field, index) => ['ga4_' + field, values[index]]));
+        return snapshot();
+    }
+
+    return { snapshot, collect };
+}
+
+  const attributionCollector = createAttributionCollector();
+  attributionCollector.snapshot();
 
   function storageSnapshot() {
     const result = {};
@@ -41,33 +152,57 @@
       frame.style.setProperty(property.replace(/[A-Z]/g, c => '-' + c.toLowerCase()), value, 'important');
     }
 
-    function sendContext() {
+    // Use the HOST viewport: the narrow iframe is also narrow on desktop.
+    const mobileViewport = window.matchMedia('(max-width: 767px)');
+    let widgetOpen = false;
+    let closeResizeTimer;
+    function resizeFrame() {
+      const bottom = mobileViewport.matches
+        ? `calc(${mobileBottom - 16}px + env(safe-area-inset-bottom, 0px))` : '0px';
+      const availableHeight = mobileViewport.matches
+        ? `calc(100dvh - ${mobileBottom - 16}px - env(safe-area-inset-bottom, 0px))` : '100dvh';
+      frame.style.setProperty('bottom', bottom, 'important');
+      frame.style.setProperty('width', widgetOpen ? 'min(374px, 100vw)' : 'min(290px, 100vw)', 'important');
+      frame.style.setProperty('height', `min(${widgetOpen ? 680 : 110}px, ${availableHeight})`, 'important');
+    }
+    resizeFrame();
+    if (mobileViewport.addEventListener) mobileViewport.addEventListener('change', resizeFrame);
+    else mobileViewport.addListener(resizeFrame);
+
+    function sendContext(requestId, tracking = attributionCollector.snapshot()) {
       frame.contentWindow?.postMessage({
-        type: 'archie-host-context',
+        type: 'archie-host-context', requestId,
+        hostOrigin: window.location.origin,
         pageUrl: window.location.href,
         pageTitle: document.title || '',
         referrer: document.referrer || '',
-        storage: storageSnapshot()
+        tracking, storage: storageSnapshot()
       }, frameOrigin);
+    }
+    async function sendFreshContext(requestId) {
+      const tracking = await attributionCollector.collect();
+      sendContext(requestId, tracking);
     }
 
     window.addEventListener('message', function (event) {
       if (event.source !== frame.contentWindow || event.origin !== frameOrigin) return;
       const data = event.data;
-      if (data?.type === 'archie-widget-ready') sendContext();
+      if (data?.type === 'archie-widget-ready') {
+        sendContext();
+        sendFreshContext();
+      }
+      if (data?.type === 'archie-attribution-request') sendFreshContext(data.requestId);
       if (data?.type === 'archie-widget-size') {
-        const resize = () => {
-          frame.style.setProperty('width', data.open ? 'min(374px, 100vw)' : 'min(290px, 100vw)', 'important');
-          frame.style.setProperty('height', data.open ? 'min(680px, 100dvh)' : 'min(110px, 100dvh)', 'important');
-        };
-        if (data.open) resize(); else setTimeout(resize, 280);
+        widgetOpen = data.open === true;
+        clearTimeout(closeResizeTimer);
+        if (widgetOpen) resizeFrame(); else closeResizeTimer = setTimeout(resizeFrame, 280);
       }
       if (data?.type === 'archie-storage-set' && keys.includes(data.key) && typeof data.value === 'string') {
         try { window.localStorage.setItem(data.key, data.value); } catch (_) {}
       }
     });
 
-    frame.addEventListener('load', sendContext);
+    frame.addEventListener('load', () => { sendContext(); sendFreshContext(); });
     document.body.appendChild(frame);
     const iframeUrl = new URL('index.html', pageBase);
     iframeUrl.searchParams.set('v', String(Date.now()));

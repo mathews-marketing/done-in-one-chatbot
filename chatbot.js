@@ -14,15 +14,122 @@
 
     };
 
-    // The launcher supplies the host page and first-party visitor state.
+// Runs on the host page. It reads existing tags/cookies; it installs no tracking tags.
+function createAttributionCollector() {
+    const parameterNames = [
+        'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+        'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'ttclid'
+    ];
+    const sessionKey = 'doiChatAttributionV1';
+    const sessionTtl = 30 * 60 * 1000;
+    let memoryAttribution = null;
+    let recentGa4 = {};
+
+    function readSession() {
+        let value = memoryAttribution;
+        try {
+            value = JSON.parse(window.sessionStorage.getItem(sessionKey) || 'null') || value;
+        } catch (_) { /* Use the in-page fallback when storage is blocked. */ }
+        return value && Date.now() - Number(value.lastSeenAt) < sessionTtl ? value : null;
+    }
+
+    function readCookie(name) {
+        try {
+            const entry = document.cookie.split(';').map(value => value.trim())
+                .find(value => value.startsWith(name + '='));
+            if (!entry) return null;
+            const value = entry.slice(name.length + 1);
+            try { return decodeURIComponent(value); } catch (_) { return value; }
+        } catch (_) { return null; }
+    }
+
+    function measurementId() {
+        if (typeof window.__archieGA4MeasurementId === 'string') return window.__archieGA4MeasurementId;
+        const ids = {
+            'getdoneinone.com': 'G-Y8D0SC75XT',
+            'www.getdoneinone.com': 'G-Y8D0SC75XT',
+            'go.getdoneinone.com': 'G-VC7X2696N3'
+        };
+        return ids[window.location.hostname] || null;
+    }
+
+    function snapshot() {
+        const params = new URL(window.location.href).searchParams;
+        const incoming = Object.fromEntries(parameterNames.map(key => [key, params.get(key) || null]));
+        const fingerprint = JSON.stringify(incoming);
+        let cached = readSession();
+        if (Object.values(incoming).some(value => value !== null) && cached?.fingerprint !== fingerprint) {
+            cached = {
+                parameters: incoming, fingerprint,
+                landingPageUrl: window.location.href,
+                referrerUrl: document.referrer || null,
+                capturedAt: new Date().toISOString()
+            };
+        }
+        if (cached) {
+            cached.lastSeenAt = Date.now();
+            memoryAttribution = cached;
+            try { window.sessionStorage.setItem(sessionKey, JSON.stringify(cached)); } catch (_) {}
+        }
+        return {
+            ...Object.fromEntries(parameterNames.map(key => [key, cached?.parameters?.[key] || null])),
+            pageUrl: window.location.href,
+            pageTitle: document.title || '',
+            referrer: document.referrer || null,
+            attribution_page_url: cached?.landingPageUrl || window.location.href,
+            attribution_referrer_url: cached?.referrerUrl || document.referrer || null,
+            attribution_captured_at: cached?.capturedAt || null,
+            hubspotutk: readCookie('hubspotutk'),
+            ga4_measurement_id: measurementId(),
+            ga4_client_id: recentGa4.ga4_client_id || null,
+            ga4_session_id: recentGa4.ga4_session_id || null,
+            ga4_session_number: recentGa4.ga4_session_number || null
+        };
+    }
+
+    function getGa4Value(field) {
+        return new Promise(resolve => {
+            const id = measurementId();
+            const tag = typeof window.gtag === 'function' ? window.gtag :
+                (Array.isArray(window.dataLayer) ? function () { window.dataLayer.push(arguments); } : null);
+            if (!id || !tag) { resolve(null); return; }
+            let done = false;
+            const finish = value => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve(value === undefined || value === null || value === '' ? null : String(value));
+            };
+            const timer = setTimeout(() => finish(null), 1600);
+            try { tag('get', id, field, finish); } catch (_) { finish(null); }
+        });
+    }
+
+    async function collect() {
+        // Capture the landing URL before waiting for an analytics callback.
+        snapshot();
+        const fields = ['client_id', 'session_id', 'session_number'];
+        const values = await Promise.all(fields.map(getGa4Value));
+        // Do not fabricate IDs or retain stale IDs if analytics is unavailable.
+        recentGa4 = Object.fromEntries(fields.map((field, index) => ['ga4_' + field, values[index]]));
+        return snapshot();
+    }
+
+    return { snapshot, collect };
+}
+
+    // The parent page owns attribution, cookies and GA4 for the iframe.
     let hostContext = window.__archieHostContext || {
-        pageUrl: document.referrer || window.location.href,
-        pageTitle: document.title || '',
-        referrer: '',
-        storage: {}
+        pageUrl: window.parent === window ? window.location.href : (document.referrer || ''),
+        pageTitle: window.parent === window ? document.title || '' : '',
+        referrer: window.parent === window ? document.referrer || '' : '',
+        storage: {}, tracking: {}
     };
     const allowedStorageKeys = ['doiChatVisitorId', 'chatSessionId', 'implantBotName'];
     const memoryStorage = { ...(hostContext.storage || {}) };
+    const pendingAttribution = new Map();
+    let expectedHostOrigin = '';
+    try { expectedHostOrigin = new URL(hostContext.hostOrigin || document.referrer).origin; } catch (_) {}
     const storage = {
         getItem(key) {
             if (Object.prototype.hasOwnProperty.call(memoryStorage, key)) return memoryStorage[key];
@@ -32,25 +139,76 @@
             memoryStorage[key] = String(value);
             try { localStorage.setItem(key, String(value)); } catch (_) {}
             if (window.parent !== window && allowedStorageKeys.includes(key)) {
-                window.parent.postMessage({ type: 'archie-storage-set', key, value: String(value) }, '*');
+                window.parent.postMessage({ type: 'archie-storage-set', key, value: String(value) }, expectedHostOrigin || '*');
             }
         }
     };
-    window.addEventListener('message', (event) => {
-        if (event.source !== window.parent || event.data?.type !== 'archie-host-context') return;
-        const data = event.data;
+    function applyHostContext(data) {
         hostContext = {
+            ...hostContext,
             pageUrl: typeof data.pageUrl === 'string' ? data.pageUrl : hostContext.pageUrl,
             pageTitle: typeof data.pageTitle === 'string' ? data.pageTitle : hostContext.pageTitle,
-            referrer: typeof data.referrer === 'string' ? data.referrer : hostContext.referrer
+            referrer: typeof data.referrer === 'string' ? data.referrer : hostContext.referrer,
+            tracking: data.tracking && typeof data.tracking === 'object' ? data.tracking : (hostContext.tracking || {})
         };
+        for (const key of allowedStorageKeys) {
+            if (typeof data.storage?.[key] === 'string') memoryStorage[key] = data.storage[key];
+        }
+    }
+    window.addEventListener('message', (event) => {
+        if (event.source !== window.parent || event.data?.type !== 'archie-host-context') return;
+        if (expectedHostOrigin && event.origin !== expectedHostOrigin) return;
+        if (!expectedHostOrigin && event.origin && event.origin !== 'null') expectedHostOrigin = event.origin;
+        applyHostContext(event.data);
+        const request = pendingAttribution.get(event.data.requestId);
+        if (request) request();
     });
+    const localAttribution = window.parent === window ? createAttributionCollector() : null;
+    async function collectSubmissionAttribution() {
+        if (localAttribution) {
+            hostContext.tracking = await localAttribution.collect();
+            hostContext.pageUrl = window.location.href;
+            hostContext.pageTitle = document.title || '';
+            hostContext.referrer = document.referrer || '';
+        } else {
+            const requestId = createTrackingId('attribution');
+            await new Promise(resolve => {
+                let done = false;
+                const finish = () => {
+                    if (done) return;
+                    done = true; clearTimeout(timer);
+                    pendingAttribution.delete(requestId); resolve();
+                };
+                const timer = setTimeout(finish, 2300);
+                pendingAttribution.set(requestId, finish);
+                window.parent.postMessage({ type: 'archie-attribution-request', requestId }, expectedHostOrigin || '*');
+            });
+        }
+        const tracking = hostContext.tracking || {};
+        const keys = ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'utm_id',
+            'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'ttclid', 'hubspotutk',
+            'ga4_client_id', 'ga4_session_id', 'ga4_session_number', 'ga4_measurement_id',
+            'attribution_page_url', 'attribution_referrer_url', 'attribution_captured_at'];
+        return {
+            ...Object.fromEntries(keys.map(key => [key, tracking[key] ?? null])),
+            pageUrl: hostContext.pageUrl || tracking.pageUrl || null,
+            pageTitle: hostContext.pageTitle || tracking.pageTitle || '',
+            referrer: hostContext.referrer || tracking.referrer || null,
+            fullCaptureUrl: hostContext.pageUrl || tracking.pageUrl || null,
+            pageName: hostContext.pageTitle || tracking.pageTitle || '',
+            referrerUrl: hostContext.referrer || tracking.referrer || null
+        };
+    }
+    function mapPreferredOffice(value) {
+        return { 'Boca Raton': 'In-Person: Boca Raton', 'Tampa': 'In-Person: Tampa',
+            'Jacksonville': 'In-Person: Jacksonville', 'Virtual': 'Virtual' }[value] || null;
+    }
 
     // Constants
 
-    const WEBHOOK_URL = 'https://api.mikemathewscmo.com/webhook/website-chatbot-to-crm1'; 
+    const WEBHOOK_URL = 'https://api.mikemathewscmo.com/webhook/schedule-consultation'; 
 
-    const N8N_WEBHOOK_URL = 'https://api.mikemathewscmo.com/webhook/website-chatbot-doi-v3';
+    const N8N_WEBHOOK_URL = 'https://api.mikemathewscmo.com/webhook/ask-archie-question';
 
     const NOTIFICATION_SOUND_URL = 'https://assets.cdn.filesafe.space/pavIFdgrv0CTos4BgVKm/media/6a01a85abc1f77cc3588852a.mp3';
 
@@ -395,7 +553,7 @@
 
                 await appendBotMessageWithTyping("Perfect. Tell us how to reach you and our team will contact you to confirm your consultation time.", 1200); await wait(800);
 
-                chatHistory.insertAdjacentHTML('beforeend', `<div class="flex flex-col items-center w-full animate-message mt-3 shrink-0" id="consult-form-4"><form onsubmit="event.preventDefault(); window.appBot.submitConsult(this);" class="w-full bg-white border border-slate-100 p-4 rounded-2xl shadow-card m-0"><input type="text" name="name" placeholder="Full Name" required class="chat-input-field" value="${savedName || ''}"/><input type="tel" name="phone" placeholder="Phone Number" required class="chat-input-field"/><input type="email" name="email" placeholder="Email Address (Optional)" class="chat-input-field !mb-2"/><div class="text-[10.5px] text-slate-500 text-center leading-tight mb-4 mt-2">By submitting this form, you consent to receive text messages and promotional offers. Msg & data rates may apply.</div><button type="submit" class="w-full bg-premium-900 text-white font-bold py-3.5 rounded-xl hover:bg-premium-800 transition-colors active:scale-95 border-none outline-none focus:outline-none cursor-pointer m-0" style="border: none !important;">Check My Eligibility</button></form></div>`);
+                chatHistory.insertAdjacentHTML('beforeend', `<div class="flex flex-col items-center w-full animate-message mt-3 shrink-0" id="consult-form-4"><form onsubmit="event.preventDefault(); window.appBot.submitConsult(this);" class="w-full bg-white border border-slate-100 p-4 rounded-2xl shadow-card m-0"><input type="text" name="name" placeholder="Full Name" required class="chat-input-field" value="${savedName || ''}"/><input type="tel" name="phone" placeholder="Phone Number" required class="chat-input-field"/><input type="email" name="email" placeholder="Email Address" required class="chat-input-field !mb-2"/><div class="text-[10.5px] text-slate-500 text-center leading-tight mb-4 mt-2">By submitting this form, you consent to receive text messages and promotional offers. Msg & data rates may apply.</div><button type="submit" class="w-full bg-premium-900 text-white font-bold py-3.5 rounded-xl hover:bg-premium-800 transition-colors active:scale-95 border-none outline-none focus:outline-none cursor-pointer m-0" style="border: none !important;">Check My Eligibility</button></form></div>`);
 
                 if (typeof lucide !== 'undefined' && lucide.createIcons) { lucide.createIcons(); }
 
@@ -437,7 +595,7 @@
 
                 await appendBotMessageWithTyping("Thanks for sharing. Our team can review your answers and talk through whether Done In One may be right for you. How can we reach you?", 1500); await wait(800);
 
-                chatHistory.insertAdjacentHTML('beforeend', `<div class="flex flex-col items-center w-full animate-message mt-3 shrink-0" id="candidate-form-2"><form onsubmit="event.preventDefault(); window.appBot.submitCandidate(this);" class="w-full bg-white border border-slate-100 p-4 rounded-2xl shadow-card m-0"><input type="text" name="name" placeholder="Full Name" required class="chat-input-field" value="${savedName || ''}"/><input type="tel" name="phone" placeholder="Phone Number" required class="chat-input-field"/><button type="submit" class="w-full bg-accent-500 text-premium-900 font-bold py-3.5 rounded-xl hover:bg-accent-400 transition-colors active:scale-95 mt-2 border-none outline-none focus:outline-none cursor-pointer m-0" style="border: none !important;">Request a Follow-Up</button></form></div>`);
+                chatHistory.insertAdjacentHTML('beforeend', `<div class="flex flex-col items-center w-full animate-message mt-3 shrink-0" id="candidate-form-2"><form onsubmit="event.preventDefault(); window.appBot.submitCandidate(this);" class="w-full bg-white border border-slate-100 p-4 rounded-2xl shadow-card m-0"><input type="text" name="name" placeholder="Full Name" required class="chat-input-field" value="${savedName || ''}"/><input type="tel" name="phone" placeholder="Phone Number" required class="chat-input-field"/><input type="email" name="email" placeholder="Email Address" required class="chat-input-field !mb-2"/><button type="submit" class="w-full bg-accent-500 text-premium-900 font-bold py-3.5 rounded-xl hover:bg-accent-400 transition-colors active:scale-95 mt-2 border-none outline-none focus:outline-none cursor-pointer m-0" style="border: none !important;">Request a Follow-Up</button></form></div>`);
 
                 if (typeof lucide !== 'undefined' && lucide.createIcons) { lucide.createIcons(); }
 
@@ -451,9 +609,9 @@
 
                 chatHeaderTitle.innerText = "Pricing & Financing"; stepIndicator.classList.add('opacity-0');
 
-                await appendBotMessageWithTyping("The cost of treatment depends on your needs. Our team can explain your options and provide a personalized estimate during a free consultation.", 1200);
+                await appendBotMessageWithTyping("Our pricing is $13,900 for a single arch and $26,900 for full mouth (double arch). Here are the details:", 1200);
 
-                chatHistory.insertAdjacentHTML('beforeend', `<div class="bg-white border border-slate-100 shadow-card rounded-2xl p-4 text-[13.5px] text-slate-700 leading-relaxed font-medium animate-message w-[90%] flex flex-col gap-3 shrink-0 mt-2 m-0"><div><strong class="text-premium-900 block text-[15px] mb-1">Single Arch or Full Mouth</strong>Our team will explain the treatment options that fit your needs.</div><div class="border-t border-slate-100 pt-3"><strong class="text-premium-900 block text-[15px] mb-1">Pricing &amp; Financing</strong>You'll receive a personalized estimate and can ask about available financing options.</div></div>`);
+                chatHistory.insertAdjacentHTML('beforeend', `<div class="bg-white border border-slate-100 shadow-card rounded-2xl p-4 text-[13.5px] text-slate-700 leading-relaxed font-medium animate-message w-[90%] flex flex-col gap-3 shrink-0 mt-2 m-0"><div><strong class="text-premium-900 block text-[15px] mb-1">Single Arch: $13,900</strong>Upper or lower arch.</div><div class="border-t border-slate-100 pt-3"><strong class="text-premium-900 block text-[15px] mb-1">Full Mouth / Double Arch: $26,900</strong>Both upper and lower arches.</div><div class="border-t border-slate-100 pt-3"><strong class="text-premium-900 block text-[15px] mb-1">Financing</strong>Ask our team about available financing options during your free consultation.</div></div>`);
 
                 await wait(1500); await appendBotMessageWithTyping("Would you like to schedule a free consultation to discuss your options?", 1000); await wait(600);
 
@@ -499,7 +657,17 @@
 
                     const controller = new AbortController(); const timeoutId = setTimeout(() => controller.abort(), 15000); 
 
-                    const res = await fetch(N8N_WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: message, name: storage.getItem('implantBotName') || '', phone: '', email: '', visitorId: getChatVisitorId(), sessionId: getChatSessionId(), eventId: createTrackingId('question'), formId: 'doi-ask-question-v1', source: 'Website Chatbot - Ask a Question', pageUrl: hostContext.pageUrl, pageTitle: hostContext.pageTitle, referrer: hostContext.referrer, userAgent: navigator.userAgent || '', timestamp: new Date().toISOString() }), signal: controller.signal });
+                    const attribution = await collectSubmissionAttribution();
+                    const sentAt = new Date().toISOString();
+                    const questionPayload = {
+                        message, name: storage.getItem('implantBotName') || '', phone: '', email: '',
+                        visitorId: getChatVisitorId(), sessionId: getChatSessionId(),
+                        eventId: createTrackingId('question'), formId: 'doi-ask-question-v1',
+                        source: 'Website Chatbot - Ask a Question', ...attribution,
+                        userAgent: navigator.userAgent || '', timestamp: sentAt,
+                        last_chatbot_contact: sentAt
+                    };
+                    const res = await fetch(N8N_WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(questionPayload), signal: controller.signal });
 
                     clearTimeout(timeoutId); if (!res.ok) throw new Error('Network error');
 
@@ -549,9 +717,11 @@
 
             submitConsult: async function(form) {
 
+                if (!form.reportValidity()) return;
+
                 const fd = new FormData(form); const state = window.implantBotState.consult; const payload = this.getBasePayload('Consultation Request');
 
-                payload.interest = state.interest; payload.location = state.location; payload.best_time = state.best_time; payload.name = fd.get('name') || ''; payload.phone = fd.get('phone') || ''; payload.email = fd.get('email') || '';
+                payload.interest = state.interest; payload.location = state.location; payload.best_time = state.best_time; payload.name = fd.get('name') || ''; payload.phone = fd.get('phone') || ''; payload.email = String(fd.get('email') || '').trim();
 
                 if (payload.name) storage.setItem('implantBotName', payload.name); form.parentElement.remove(); appendUserMessage(`${payload.name} • ${payload.phone}`); await this.processSubmission(payload, 'Consultation Request');
 
@@ -559,9 +729,11 @@
 
             submitCandidate: async function(form) {
 
+                if (!form.reportValidity()) return;
+
                 const fd = new FormData(form); const state = window.implantBotState.candidate; const payload = this.getBasePayload('Candidate Quiz Lead');
 
-                payload.current_state = state.current_state; payload.timeframe = state.timeframe; payload.name = fd.get('name') || ''; payload.phone = fd.get('phone') || '';
+                payload.current_state = state.current_state; payload.timeframe = state.timeframe; payload.name = fd.get('name') || ''; payload.phone = fd.get('phone') || ''; payload.email = String(fd.get('email') || '').trim();
 
                 if (payload.name) storage.setItem('implantBotName', payload.name); document.getElementById('candidate-form-2').remove(); appendUserMessage(`${payload.name} • ${payload.phone}`); await this.processSubmission(payload, 'Candidate Quiz');
 
@@ -573,6 +745,15 @@
 
                 try {
 
+                    const attribution = await collectSubmissionAttribution();
+                    const sentAt = new Date().toISOString();
+                    Object.assign(payload, attribution, {
+                        fullName: payload.name || '', phoneNumber: payload.phone || '', emailAddress: payload.email || '',
+                        treatmentInterest: payload.interest || '', treatment_interest: payload.interest || '',
+                        preferredOffice: payload.location || '', preferred_office: mapPreferredOffice(payload.location),
+                        bestTimeToContact: payload.best_time || '', best_time_to_contact: payload.best_time || '',
+                        timestamp: sentAt, last_chatbot_contact: sentAt
+                    });
                     const response = await fetch(WEBHOOK_URL, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
 
                     if (!response.ok) throw new Error('Network error'); stepIndicator.innerText = "Done"; this.showConfirmation(type);
