@@ -201,7 +201,8 @@ function createAttributionCollector() {
     }
     function mapPreferredOffice(value) {
         return { 'Boca Raton': 'In-Person: Boca Raton', 'Tampa': 'In-Person: Tampa',
-            'Jacksonville': 'In-Person: Jacksonville', 'Virtual': 'Virtual' }[value] || null;
+            'Jacksonville': 'In-Person: Jacksonville',
+            'Salt Lake City': 'In-Person: Salt Lake City', 'Virtual': 'Virtual' }[value] || null;
     }
 
     // Constants
@@ -499,7 +500,7 @@ function createAttributionCollector() {
 
                 await appendBotMessageWithTyping(intro, 1200); await wait(800); await appendBotMessageWithTyping("Preferred Location?", 800); await wait(400);
 
-                const opts = ['Boca Raton', 'Tampa', 'Jacksonville', 'Virtual'];
+                const opts = ['Boca Raton', 'Tampa', 'Jacksonville', 'Salt Lake City', 'Virtual'];
 
                 appendOptions('consult-opts-container-1', `<div class="flex gap-2 w-[90%] flex-wrap mb-2 pl-[38px]">${opts.map(opt => `<button type="button" onclick="window.appBot.handleConsultStep('location', '${opt}')" class="w-auto bg-white border border-premium-900/30 rounded-full py-1.5 px-4 text-[13px] font-medium text-premium-900 hover:bg-premium-50 transition-colors shadow-sm active:scale-95 text-center cursor-pointer">${opt}</button>`).join('')}</div>`);
 
